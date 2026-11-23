@@ -1,0 +1,14 @@
+{
+  "interval_seconds": 60,
+  "samples_per_row": 2016,
+  "rows": [
+    "cpu_usage_rate",
+    "mem_working_set",
+    "net_rx_bytes_rate",
+    "fs_reads_rate",
+    "threads",
+    "restarts_rate",
+    "oom_rate",
+    "psi_mem_stalled_rate"
+  ]
+}

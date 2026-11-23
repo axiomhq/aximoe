@@ -1,0 +1,8 @@
+# The tracked model card, its license, its figures and their script.
+*
+!.gitignore
+!README.md
+!LICENSE
+!figures.py
+!images/
+!images/*.png

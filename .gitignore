@@ -1,0 +1,13 @@
+# model weights live in data/models
+*.pt
+*.bpk
+# the data directory, a directory or a symlink; corpora, stores, models and benchmarks
+/data
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.claude
+*.egg-info/
+# the output of the README's forecast example
+/bands.f32*
