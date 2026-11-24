@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Aximö forecasts OpenTelemetry and Kubernetes container metrics as a band of quantiles"
 requires-python = ">=3.12"
 dependencies = [
-    "torch==2.6.0",
+    "torch==2.13.0",
     "numpy==1.26.4",
     "scipy==1.15.3",
     "pandas==2.2.3",
