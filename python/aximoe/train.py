@@ -44,7 +44,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from aximoe import batches, fastpass, guide, periodic, reference, student  # noqa: E402
+from aximoe import batches, fastpass, guide, muon, periodic, reference, student  # noqa: E402
 from aximoe import store as teacher_store  # noqa: E402
 from aximoe.student import LEVELS, MEDIAN, PATCH, POSITIONS, SEQ, SHARED, Student, StudentConfig  # noqa: E402
 
@@ -917,6 +917,11 @@ def parse(argv=None) -> argparse.Namespace:
                          "and fp16 elsewhere, and f32 on other devices")
     ap.add_argument("--tf32", default="off", choices=["on", "off"], help="TensorFloat-32 matrix products on cards that have them")
     ap.add_argument("--fused", default="on", choices=["on", "off"], help="AdamW's update as one operation per parameter tensor")
+    ap.add_argument("--optimizer", default="adamw", choices=["adamw", "muon"],
+                    help="muon: Muon (muon.py) on each layer's attention and feed-forward matrices, AdamW on every other parameter")
+    ap.add_argument("--muon-momentum", type=float, default=0.95, help="with --optimizer muon: Muon's Nesterov momentum")
+    ap.add_argument("--muon-scale", type=float, default=0.4,
+                    help="with --optimizer muon: the update's element RMS before the learning rate, as s in s sqrt(max(rows, columns))")
     ap.add_argument("--pin", default="on", choices=["on", "off"], help="batches in page-locked memory")
     ap.add_argument("--unroll-ahead", default="off", choices=["on", "off"],
                     help="a step's batch is built and unrolled in a process of its own while the trainer trains on the batch "
@@ -1021,6 +1026,7 @@ def main(argv=None, link=None):
         model = Student(cfg).to(device)
     if resume:
         model.load_state_dict(resume["model"])
+    matrices, rest = muon.split(model) if args.optimizer == "muon" else (None, None)
     description = student.describe(cfg, store.meta.get("model", ""), tags.known_channels(index) if cfg.tags else {},
                                    tags.widths if cfg.resolutions else [], groups["groups"] if groups else None)
     print(f"{device}\nstore {args.store} ({store.n} tiles, teacher {store.meta.get('model', '')}), "
@@ -1050,7 +1056,8 @@ def main(argv=None, link=None):
           f"{'' if cfg.io_hidden < 0 else f' embedding and head hidden width {cfg.io_hidden}'}"
           f" balance {args.balance}, batch {args.batch}, "
           f"lr {args.lr} warm-up {args.warmup}, lambda {args.lambda_[0]}->{args.lambda_[1]}, compile {args.compile}, "
-          f"dtype {args.dtype}", flush=True)
+          f"dtype {args.dtype}, optimizer {args.optimizer}"
+          f"{muon.describe(matrices, rest, args.muon_momentum, args.muon_scale) if matrices else ''}", flush=True)
 
     shares = ({int(w): float(x) for w, x in (pair.split(":") for pair in args.width_shares.split(","))}
               if args.width_shares else None)
@@ -1122,12 +1129,16 @@ def main(argv=None, link=None):
             print(f"ahead teacher, synthetic: {int(ahead.held(sampler.synthetic).sum())} of {len(sampler.synthetic)} "
                   f"training tiles", flush=True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-5, weight_decay=0.01,
-                            **({"fused": True} if args.fused == "on" else {"foreach": True}))
+    opt = torch.optim.AdamW(model.parameters() if matrices is None else rest, lr=args.lr, betas=(0.9, 0.999), eps=1e-5,
+                            weight_decay=0.01, **({"fused": True} if args.fused == "on" else {"foreach": True}))
+    opts = [opt] if matrices is None else [opt, muon.Muon(matrices, lr=args.lr, momentum=args.muon_momentum,
+                                                          scale=args.muon_scale, weight_decay=0.01)]
     # float16 gradients underflow unscaled; the scaler passes everything through in the other types
     scaler = torch.amp.GradScaler(device.type, enabled=args.dtype == "fp16")
     if resume:
         opt.load_state_dict(resume["optimiser"])
+        if matrices is not None:
+            opts[1].load_state_dict(resume["muon"])
         scaler.load_state_dict(resume.get("scaler", scaler.state_dict()))
     forward_full = torch.compile(model.forward_full, mode=args.compile_mode) if args.compile == "on" else model.forward_full
     hidden_fn = torch.compile(model.hidden, mode=args.compile_mode) if args.compile == "on" else model.hidden
@@ -1451,8 +1462,9 @@ def main(argv=None, link=None):
         lr =args.lr if args.warmup == 0 else args.lr * min((step + 1) / args.warmup, 1.0)
         if args.lr_decay == "cosine":
             lr *= args.lr_floor + (1.0 - args.lr_floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
-        for g in opt.param_groups:
-            g["lr"] = lr
+        for o in opts:
+            for g in o.param_groups:
+                g["lr"] = lr
         if ahead_run is not None:
             batch, data, states = ahead_run.next()
             group = batch.get("group")
@@ -1498,11 +1510,16 @@ def main(argv=None, link=None):
                        pred, batch))
         read_checks(step, False)
         scaler.scale(total).backward()
-        scaler.unscale_(opt)
+        for o in opts:
+            scaler.unscale_(o)
+        if len(opts) > 1:
+            muon.skip_together(scaler, opts)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(opt)
+        for o in opts:
+            scaler.step(o)
         scaler.update()
-        opt.zero_grad(set_to_none=True)
+        for o in opts:
+            o.zero_grad(set_to_none=True)
         if ahead_run is not None:
             with torch.no_grad():
                 ahead_run.publish(step, torch.nn.utils.parameters_to_vector(model.parameters()))
@@ -1537,7 +1554,8 @@ def main(argv=None, link=None):
                         "scaler": scaler.state_dict(),
                         "generators": states if ahead_run is not None else {name: g.get_state() for name, g in generators.items()},
                         "torch": torch.get_rng_state(),
-                        "cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else None, "data": data},
+                        "cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else None, "data": data,
+                        **({"muon": opts[1].state_dict()} if len(opts) > 1 else {})},
                        os.path.join(args.save, "resume.tmp"))
             os.replace(os.path.join(args.save, "resume.tmp"), os.path.join(args.save, "resume.pt"))
     read_checks(step, True)
